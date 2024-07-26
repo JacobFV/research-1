@@ -13,20 +13,44 @@ from abc import ABC, abstractmethod
 import sys
 import subprocess
 import queue
+import pydantic
 import time
 from scipy.spatial.distance import cosine
 from sqlalchemy import text
+from datetime import datetime
 
 # Initialize the OpenAI and Anthropic clients
 openai_client = OpenAI()
 anthropic_client = Anthropic()
 
 
-class Memory(SQLModel, table=True):
+class AbstractMemory(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     content: str
     embedding: List[float] = Field(sa_column=Vector(384))
-    do_not_delete: bool = Field(default=False)  # New field
+    do_not_delete: bool = Field(default=False)
+
+    __table_args__ = {"extend_existing": True}
+
+
+class GroundTruthMemory(AbstractMemory, table=True):
+    __tablename__ = "ground_truth_memory"
+
+
+class RelationMemory(AbstractMemory, table=True):
+    __tablename__ = "relation_memory"
+    src_id: int = Field(foreign_key="abstract_memory.id")
+    dst_id: int = Field(foreign_key="abstract_memory.id")
+
+
+class SyntheticRelationMemory(RelationMemory, table=True):
+    __tablename__ = "synthetic_relation_memory"
+    confidence: float
+
+
+class TemporalRelationMemory(RelationMemory, table=True):
+    __tablename__ = "temporal_relation_memory"
+    timestamp: datetime
 
 
 class ExtractedMemories(BaseModel):
@@ -45,7 +69,7 @@ def parse_model(model: type[BaseModel], prompt: str, **kwargs) -> BaseModel:
     )
 
 
-class Agent(ABC):
+class Agent(BaseModel, ABC):
     @abstractmethod
     def input(self, data: Any, **kwargs):
         pass
@@ -55,13 +79,6 @@ class Agent(ABC):
         pass
 
 
-class MemoryRelation(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    src_id: int = Field(foreign_key="memory.id")
-    dst_id: int = Field(foreign_key="memory.id")
-    relation: str
-
-
 class RAGAgent(Agent):
     OPENAI_MODEL = "gpt-4-turbo-preview"
     ANTHROPIC_MODEL = "claude-3-sonnet-20240229"
@@ -69,15 +86,6 @@ class RAGAgent(Agent):
     MAX_TOKENS = 300
     INITIAL_KNOWLEDGE = [
         "I am an experimental AI system",
-        "I am designed to assist with research and information retrieval",
-        "My knowledge comes from a combination of pre-loaded information and user interactions",
-        "I can learn and update my knowledge base through conversations",
-        "I use a RAG (Retrieval-Augmented Generation) system to access and utilize information",
-        "I strive to provide accurate and helpful information to the best of my abilities",
-        "I can analyze and synthesize information from multiple sources",
-        "I am capable of understanding and responding to complex queries",
-        "My responses are generated based on the most relevant information I can retrieve",
-        "I can adapt my communication style to suit different users and contexts",
         "I am continuously improving through feedback and new interactions",
     ]
     DB_URL = "postgresql://user:password@localhost/ragagent"
@@ -174,31 +182,53 @@ class RAGAgent(Agent):
 
     def load_state(self):
         with Session(self.engine) as session:
-            if session.exec(select(Memory)).first() is None:
+            if session.exec(select(AbstractMemory)).first() is None:
                 for knowledge in self.INITIAL_KNOWLEDGE:
                     self.update_knowledge_base(knowledge)
 
-    def update_knowledge_base(self, new_info: str, do_not_delete: bool = False):
+    def update_knowledge_base(
+        self, new_info: str, do_not_delete: bool = False, is_ground_truth: bool = False
+    ):
         embedding = self.embed_text(new_info)
-        memory = Memory(
-            content=new_info, embedding=embedding, do_not_delete=do_not_delete
-        )
+        if is_ground_truth:
+            memory = GroundTruthMemory(
+                content=new_info, embedding=embedding, do_not_delete=do_not_delete
+            )
+        else:
+            memory = AbstractMemory(
+                content=new_info, embedding=embedding, do_not_delete=do_not_delete
+            )
         with Session(self.engine) as session:
             session.add(memory)
             session.commit()
 
-            # Add relation to the previous memory
-            last_memory = session.exec(
-                select(Memory).order_by(Memory.id.desc()).offset(1).limit(1)
-            ).first()
-            if last_memory:
-                self.add_memory_relation(last_memory.id, memory.id, "next")
-
-    def add_memory_relation(self, src_id: int, dst_id: int, relation: str = "next"):
+    def add_memory_relation(
+        self,
+        src_id: int,
+        dst_id: int,
+        relation: str,
+        confidence: Optional[float] = None,
+        timestamp: Optional[datetime] = None,
+    ):
         with Session(self.engine) as session:
-            memory_relation = MemoryRelation(
-                src_id=src_id, dst_id=dst_id, relation=relation
-            )
+            if confidence is not None:
+                memory_relation = SyntheticRelationMemory(
+                    content=relation,
+                    src_id=src_id,
+                    dst_id=dst_id,
+                    confidence=confidence,
+                )
+            elif timestamp is not None:
+                memory_relation = TemporalRelationMemory(
+                    content=relation,
+                    src_id=src_id,
+                    dst_id=dst_id,
+                    timestamp=timestamp,
+                )
+            else:
+                memory_relation = RelationMemory(
+                    content=relation, src_id=src_id, dst_id=dst_id
+                )
             session.add(memory_relation)
             session.commit()
 
@@ -210,7 +240,7 @@ class RAGAgent(Agent):
             )
             return result.scalar_one()
 
-    def meditate_on_memories(
+    def identify_connections(
         self,
         k: int = 5,
         similarity_threshold: float = 0.5,
@@ -228,21 +258,21 @@ class RAGAgent(Agent):
                             m2.content AS memory2_content,
                             1 - cosine_distance(m1.embedding, m2.embedding) AS similarity,
                             calculate_hop_distance(m1.id, m2.id) AS hop_distance
-                        FROM memory m1
-                        CROSS JOIN memory m2
-                        WHERE m1.id < m2.id
+                        FROM abstract_memory m1
+                        CROSS JOIN abstract_memory m2
+                        WHERE m1.id != m2.id
                     )
                     SELECT 
                         memory1_content,
                         memory2_content,
                         similarity,
                         hop_distance,
-                        similarity * hop_distance AS score
+                        similarity * (1.0 / NULLIF(hop_distance, 0)) AS connection_strength
                     FROM memory_pairs
                     WHERE 
                         similarity > :sim_threshold AND 
                         hop_distance > :hop_threshold
-                    ORDER BY score DESC
+                    ORDER BY connection_strength DESC
                     LIMIT :k
                     """
                 ),
@@ -253,37 +283,32 @@ class RAGAgent(Agent):
                 },
             )
 
-            creative_ideas = []
+            connections = []
             for row in result:
-                creative_idea = self.generate_creative_idea(
+                connection = self.describe_connection(
                     row.memory1_content, row.memory2_content
                 )
-                creative_ideas.append(
+                connections.append(
                     {
-                        "idea": creative_idea,
+                        "connection": connection,
                         "memory1": row.memory1_content,
                         "memory2": row.memory2_content,
                         "similarity": row.similarity,
                         "hop_distance": row.hop_distance,
-                        "score": row.score,
+                        "connection_strength": row.connection_strength,
                     }
                 )
-            return creative_ideas
+            return connections
 
-    def calculate_similarity(
-        self, embedding1: List[float], embedding2: List[float]
-    ) -> float:
-        return 1 - cosine(embedding1, embedding2)
-
-    def generate_creative_idea(self, content1: str, content2: str) -> str:
-        prompt = f"Given these two pieces of information:\n1. {content1}\n2. {content2}\n\nGenerate a creative idea that combines or relates these concepts in a novel way."
+    def describe_connection(self, content1: str, content2: str) -> str:
+        prompt = f"Given these two pieces of information:\n1. {content1}\n2. {content2}\n\nDescribe the connection or relationship between these two pieces of information."
 
         response = openai_client.chat.completions.create(
             model=self.OPENAI_MODEL,
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a creative AI assistant tasked with generating novel ideas.",
+                    "content": "You are an AI assistant tasked with identifying and describing connections between pieces of information.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -292,12 +317,18 @@ class RAGAgent(Agent):
 
         return response.choices[0].message.content.strip()
 
+    def calculate_similarity(
+        self, embedding1: List[float], embedding2: List[float]
+    ) -> float:
+        return 1 - cosine(embedding1, embedding2)
+
     def remove_from_knowledge_base(self, info_to_remove: List[str]):
         with Session(self.engine) as session:
             for info in info_to_remove:
                 memory = session.exec(
-                    select(Memory).where(
-                        Memory.content == info, Memory.do_not_delete == False
+                    select(AbstractMemory).where(
+                        AbstractMemory.content == info,
+                        AbstractMemory.do_not_delete == False,
                     )
                 ).first()
                 if memory:
@@ -308,9 +339,9 @@ class RAGAgent(Agent):
         embedding = self.embed_text(query)
         with Session(self.engine) as session:
             related_memories = session.exec(
-                select(Memory)
-                .where(Memory.do_not_delete == False)
-                .order_by(Memory.embedding.cosine_distance(embedding))
+                select(AbstractMemory)
+                .where(AbstractMemory.do_not_delete == False)
+                .order_by(AbstractMemory.embedding.cosine_distance(embedding))
                 .limit(k)
             ).all()
             for memory in related_memories:
@@ -319,7 +350,7 @@ class RAGAgent(Agent):
 
     def set_memory_do_not_delete(self, memory_id: int, do_not_delete: bool = True):
         with Session(self.engine) as session:
-            memory = session.get(Memory, memory_id)
+            memory = session.get(AbstractMemory, memory_id)
             if memory:
                 memory.do_not_delete = do_not_delete
                 session.add(memory)
@@ -329,10 +360,35 @@ class RAGAgent(Agent):
 
     def get_all_memories(self) -> List[dict]:
         with Session(self.engine) as session:
-            memories = session.exec(select(Memory)).all()
+            memories = session.exec(select(AbstractMemory)).all()
             return [
-                {"id": m.id, "content": m.content, "do_not_delete": m.do_not_delete}
+                {
+                    "id": m.id,
+                    "content": m.content,
+                    "do_not_delete": m.do_not_delete,
+                    "type": type(m).__name__,
+                }
                 for m in memories
+            ]
+
+    def get_memory_relations(self, memory_id: int) -> List[dict]:
+        with Session(self.engine) as session:
+            relations = session.exec(
+                select(RelationMemory).where(
+                    (RelationMemory.src_id == memory_id)
+                    | (RelationMemory.dst_id == memory_id)
+                )
+            ).all()
+            return [
+                {
+                    "src_id": r.src_id,
+                    "dst_id": r.dst_id,
+                    "relation_type": r.content,
+                    "type": type(r).__name__,
+                    "confidence": getattr(r, "confidence", None),
+                    "timestamp": getattr(r, "timestamp", None),
+                }
+                for r in relations
             ]
 
     def input(self, data: Any, **kwargs):
@@ -350,8 +406,8 @@ class RAGAgent(Agent):
         embedding = self.embed_text(self.last_query)
         with Session(self.engine) as session:
             related_memories = session.exec(
-                select(Memory)
-                .order_by(Memory.embedding.cosine_distance(embedding))
+                select(AbstractMemory)
+                .order_by(AbstractMemory.embedding.cosine_distance(embedding))
                 .limit(5)
             ).all()
             self.context = [memory.content for memory in related_memories]
@@ -411,7 +467,9 @@ class RAGAgent(Agent):
     def is_information_exists(self, info: str) -> bool:
         with Session(self.engine) as session:
             exists = (
-                session.exec(select(Memory).where(Memory.content == info)).first()
+                session.exec(
+                    select(AbstractMemory).where(AbstractMemory.content == info)
+                ).first()
                 is not None
             )
         return exists
@@ -540,13 +598,17 @@ def feed(file_path: str):
 
 
 @api_app.command()
-def add_knowledge(knowledge: str, do_not_delete: bool = False):
+def add_knowledge(
+    knowledge: str, do_not_delete: bool = False, is_ground_truth: bool = False
+):
     """Add a piece of knowledge to the RAG agent."""
     rag_agent = RAGAgent()
-    rag_agent.update_knowledge_base(knowledge, do_not_delete)
+    rag_agent.update_knowledge_base(knowledge, do_not_delete, is_ground_truth)
     typer.echo(f"Knowledge '{knowledge}' has been added to the agent's knowledge base.")
     if do_not_delete:
         typer.echo("This knowledge is marked as 'do not delete'.")
+    if is_ground_truth:
+        typer.echo("This knowledge is marked as ground truth.")
 
 
 @api_app.command()
@@ -587,27 +649,60 @@ def list_memories():
     memories = rag_agent.get_all_memories()
     for memory in memories:
         protection = "[Protected]" if memory["do_not_delete"] else ""
-        typer.echo(f"ID: {memory['id']} {protection} - {memory['content']}")
+        typer.echo(
+            f"ID: {memory['id']} {protection} - {memory['content']} ({memory['type']})"
+        )
 
 
 @api_app.command()
-def meditate(
+def get_relations(memory_id: int):
+    """Get all relations for a specific memory."""
+    rag_agent = RAGAgent()
+    relations = rag_agent.get_memory_relations(memory_id)
+    for relation in relations:
+        typer.echo(
+            f"Relation: {relation['src_id']} -> {relation['dst_id']} ({relation['relation_type']}) ({relation['type']})"
+        )
+        if relation["confidence"] is not None:
+            typer.echo(f"Confidence: {relation['confidence']}")
+        if relation["timestamp"] is not None:
+            typer.echo(f"Timestamp: {relation['timestamp']}")
+
+
+@api_app.command()
+def identify_connections(
     k: int = 5, similarity_threshold: float = 0.5, hop_distance_threshold: int = 1
 ):
-    """Meditate on memories to generate creative ideas."""
+    """Identify connections between memories in the agent's knowledge base."""
     rag_agent = RAGAgent()
-    creative_ideas = rag_agent.meditate_on_memories(
+    connections = rag_agent.identify_connections(
         k, similarity_threshold, hop_distance_threshold
     )
-    for idea in creative_ideas:
-        typer.echo(f"Creative idea: {idea['idea']}")
-        typer.echo(f"  Based on:")
-        typer.echo(f"    1. {idea['memory1']}")
-        typer.echo(f"    2. {idea['memory2']}")
-        typer.echo(f"  Similarity: {idea['similarity']:.2f}")
-        typer.echo(f"  Hop distance: {idea['hop_distance']}")
-        typer.echo(f"  Score: {idea['score']:.2f}")
+    for connection in connections:
+        typer.echo(f"Connection: {connection['connection']}")
+        typer.echo(f"  Between:")
+        typer.echo(f"    1. {connection['memory1']}")
+        typer.echo(f"    2. {connection['memory2']}")
+        typer.echo(f"  Similarity: {connection['similarity']:.2f}")
+        typer.echo(f"  Hop distance: {connection['hop_distance']}")
+        typer.echo(f"  Connection strength: {connection['connection_strength']:.2f}")
         typer.echo("")
+
+
+@api_app.command()
+def add_relation(
+    src_id: int,
+    dst_id: int,
+    relation: str,
+    confidence: Optional[float] = None,
+    timestamp: Optional[str] = None,
+):
+    """Add a relation between two memories."""
+    rag_agent = RAGAgent()
+    if timestamp:
+        timestamp = datetime.fromisoformat(timestamp)
+    rag_agent.add_memory_relation(src_id, dst_id, relation, confidence, timestamp)
+    typer.echo(f"Relation '{relation}' added between memories {src_id} and {dst_id}.")
 
 
 @app.command()
