@@ -26,7 +26,8 @@
   - pre-deployment testing
   - failsafe recovery
   - benchmarking and evolution
-  - resources (put the resources in the graph)
+  - compute and api resources (put the resources in the graph)
+  - llm calls (put the calls in the graph)
 
 ## Integrations
 
